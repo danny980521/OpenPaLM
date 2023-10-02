@@ -28,6 +28,8 @@ from megatron.model.fused_layer_norm import MixedFusedLayerNorm as LayerNorm
 from megatron.model.fused_softmax import FusedScaleMaskSoftmax
 from megatron.model.fused_bias_gelu import bias_gelu_impl
 from megatron.model.fused_gelu import gelu_impl
+from megatron.model.fused_bias_silu import bias_silu_impl
+from megatron.model.fused_silu import silu_impl
 from megatron.model.utils import attention_mask_func, openai_gelu, erf_gelu, get_linear_layer
 
 import deepspeed
@@ -185,6 +187,163 @@ class FlashSelfAttention(torch.nn.Module):
         output = flash_attn_func(q, k, v, dropout_p,softmax_scale=self.softmax_scale, causal=is_causal)
 
         return output
+
+
+class ParallelMLPSwiGLU(MegatronModule):
+    """ParallelMLPSwiGLU.
+
+    ParallelMLPSwiGLU will take the input with h hidden state, 
+    project it to 4*h hidden dimension, 
+    perform nonlinear transformation, 
+    and project the state back into h hidden dimension. 
+    At the end, dropout is also applied.
+
+    Note: multiple_of is used to compute the hidden dimension of the MLP
+    """
+
+    def __init__(self, init_method, output_layer_init_method, parallel_output=False):
+        super(ParallelMLPSwiGLU, self).__init__()
+        args = get_args()
+
+        self.multiple_of = args.multiple_of
+        
+        ffn_hidden_size = int(2 * args.hidden_size * 4 / 3)
+        ffn_hidden_size = self.multiple_of * ((ffn_hidden_size + self.multiple_of - 1) // self.muliple_of)
+
+        # Project to ffn_hidden_size
+        self.gate_proj = mpu.ColumnParallelLinear(
+            args.hidden_size,
+            ffn_hidden_size,
+            bias=args.add_bias_linear,      # Initialize bias in FFN
+            gather_output=False,
+            init_method=init_method,
+            skip_bias_add=True)             # However, no bias exists in FFN outputs 
+        
+        self.up_proj = mpu.ColumnParallelLinear(
+            args.hidden_size,
+            ffn_hidden_size,
+            bias=args.add_bias_linear,
+            gather_output=False,
+            init_method=init_method,
+            skip_bias_add=True)
+
+        self.bias_silu_fusion = args.bias_silu_fusion
+        self.silu_fusion = args.silu_fusion
+        self.activation_func = F.silu   # same as `GLU_ACTIVATIONS["swiglu"]`
+
+        # Project back to h.
+        self.down_proj = mpu.RowParallelLinear(
+            ffn_hidden_size,
+            args.hidden_size,
+            bias=args.add_bias_linear,
+            input_is_parallel=True,
+            init_method=output_layer_init_method,
+            skip_bias_add=True,
+            parallel_output=parallel_output)
+
+    def forward(self, hidden_states):
+        # [s, b, ]
+        gate_parallel, gate_bias_parallel = self.gate_proj(hidden_states)
+
+        if gate_bias_parallel is not None:
+            if self.bias_silu_fusion:
+                gate_parallel = bias_silu_impl(gate_parallel, gate_bias_parallel)
+            else:
+                gate_parallel = self.activation_func(gate_parallel + gate_bias_parallel)
+        else:
+            if self.silu_fusion:
+                gate_parallel = silu_impl(gate_parallel)
+            else:
+                gate_parallel = self.activation_func(gate_parallel)
+        
+        # [s, b, ]
+        up_parallel, up_bias_parallel = self.up_proj(hidden_states)
+
+        # [s, b, ]
+        if up_bias_parallel is not None:
+            output, output_bias = self.down_proj(gate_parallel * up_parallel + up_bias_parallel)
+        else:
+            output, output_bias = self.down_proj(gate_parallel * up_parallel)
+
+        return output, output_bias
+
+
+class ParallelMLPSwiGLU(MegatronModule):
+    """ParallelMLPSwiGLU.
+
+    ParallelMLPSwiGLU will take the input with h hidden state, 
+    project it to 4*h hidden dimension, 
+    perform nonlinear transformation, 
+    and project the state back into h hidden dimension. 
+    At the end, dropout is also applied.
+
+    Note: multiple_of is used to compute the hidden dimension of the MLP
+    """
+
+    def __init__(self, init_method, output_layer_init_method):
+        super(ParallelMLPSwiGLU, self).__init__()
+        args = get_args()
+
+        self.multiple_of = args.multiple_of
+        
+        ffn_hidden_size = int(2 * args.hidden_size * 4 / 3)
+        ffn_hidden_size = self.multiple_of * ((ffn_hidden_size + self.multiple_of - 1) // self.muliple_of)
+
+        # Project to ffn_hidden_size
+        self.gate_proj = mpu.ColumnParallelLinear(
+            args.hidden_size,
+            ffn_hidden_size,
+            bias=args.add_bias_linear,      # Initialize bias in FFN
+            gather_output=False,
+            init_method=init_method,
+            skip_bias_add=True)             # However, no bias exists in FFN outputs 
+        
+        self.up_proj = mpu.ColumnParallelLinear(
+            args.hidden_size,
+            ffn_hidden_size,
+            bias=args.add_bias_linear,
+            gather_output=False,
+            init_method=init_method,
+            skip_bias_add=True)
+
+        self.bias_silu_fusion = args.bias_silu_fusion
+        self.silu_fusion = args.silu_fusion
+        self.activation_func = F.silu   # same as `GLU_ACTIVATIONS["swiglu"]`
+
+        # Project back to h.
+        self.down_proj = mpu.RowParallelLinear(
+            ffn_hidden_size,
+            args.hidden_size,
+            bias=args.add_bias_linear,
+            input_is_parallel=True,
+            init_method=output_layer_init_method,
+            skip_bias_add=True)
+
+    def forward(self, hidden_states):
+        # [s, b, ]
+        gate_parallel, gate_bias_parallel = self.gate_proj(hidden_states)
+
+        if gate_bias_parallel is not None:
+            if self.bias_silu_fusion:
+                gate_parallel = bias_silu_impl(gate_parallel, gate_bias_parallel)
+            else:
+                gate_parallel = self.activation_func(gate_parallel + gate_bias_parallel)
+        else:
+            if self.silu_fusion:
+                gate_parallel = silu_impl(gate_parallel)
+            else:
+                gate_parallel = self.activation_func(gate_parallel)
+        
+        # [s, b, ]
+        up_parallel, up_bias_parallel = self.up_proj(hidden_states)
+
+        # [s, b, ]
+        if up_bias_parallel is not None:
+            output, output_bias = self.down_proj(gate_parallel * up_parallel + up_bias_parallel)
+        else:
+            output, output_bias = self.down_proj(gate_parallel * up_parallel)
+
+        return output, output_bias
 
 
 class ParallelAttention(MegatronModule):
@@ -787,10 +946,17 @@ class ParallelTransformerLayer(MegatronModule):
                 args.hidden_size,
                 eps=args.layernorm_epsilon)
 
-        # MLP
-        self.mlp = ParallelMLP(init_method,
-                               output_layer_init_method,
-                               parallel_output=self.use_parallel_residual)
+        # MLP (ParallelMLPSwiGLU if SwiGLU used)
+        if args.use_swiglu:
+            self.mlp = ParallelMLPSwiGLU(
+                init_method,
+                output_layer_init_method,
+                parallel_output=self.use_parallel_residual)
+        else:
+            self.mlp = ParallelMLP(
+                init_method,
+                output_layer_init_method,
+                parallel_output=self.use_parallel_residual)
 
         # Alibi
         # if args.position_embedding_type == PositionEmbeddingType.alibi:
